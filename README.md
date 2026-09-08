@@ -1,22 +1,48 @@
 # Pi Remote Attachments
 
-Ubuntu上のPiから、Windows TerminalのSSH接続元へSFTPで接続し、Explorerから貼り付けられたWindowsパスをUbuntu側へ取得するPi拡張。
+Pi extension that pulls files and directories from the Windows SSH client into
+Pi running on Ubuntu.
 
-## 前提
+## Architecture
 
-- PiはUbuntu上で起動する。
-- Windows側でOpenSSH ServerとSFTP subsystemを有効にする。
-- UbuntuからWindowsへ、パスワードなしのSSH公開鍵認証を設定する。
-- ~/.ssh/known_hosts にWindowsのホスト鍵を登録する。
+This extension is designed for this workflow:
 
-WindowsのSSHログインユーザーと、パスに含まれるWindows profile名は別物。実際のSSHログインユーザーを設定する。
+    Windows Terminal
+        └─ ssh ubuntu
+             └─ pi
 
-## インストール
+Explorer drag-and-drop pastes a Windows path into Pi. The extension detects the
+path, connects from Ubuntu to the Windows OpenSSH Server over SFTP, and stores
+the result under:
+
+    ~/.pi/attachments/<session-id>/<attachment-id>/
+
+Pi runs on Ubuntu. No Pi installation or helper program is required on
+Windows.
+
+## Requirements
+
+- Pi 0.85.0 or later
+- Windows OpenSSH Server with its SFTP subsystem enabled
+- SSH public-key authentication from Ubuntu to Windows
+- Windows host key registered in the configured known-hosts file
+
+The Windows SSH login user and the Windows profile name in a path are
+independent values. Configure the account used by the Windows OpenSSH Server.
+
+## Installation
+
+Install directly from GitHub:
 
     pi install git:github.com/tetsuya-dev-jp/pi-remote-attachments
 
-## 設定
-~/.pi/agent/remote-attachments.json を作る。/attachments setup または /attachments config でも設定できる。
+The extension can also be loaded from a local checkout:
+
+    pi -e /path/to/pi-remote-attachments/index.ts
+
+## Configuration
+
+Create ~/.pi/agent/remote-attachments.json, or run /attachments setup:
 
     {
       "windows": {
@@ -29,18 +55,25 @@ WindowsのSSHログインユーザーと、パスに含まれるWindows profile�
       }
     }
 
-host を省略すると SSH_CONNECTION、次に SSH_CLIENT のclient IPを使う。IPで接続する場合は、そのIPのホスト鍵を knownHostsFile に登録する。未知または変更されたホスト鍵は拒否する。
+If host is omitted, the extension uses the client address from
+SSH_CONNECTION, then SSH_CLIENT. When connecting by IP, register that address
+in knownHostsFile. Unknown or changed host keys are rejected.
 
-## 使い方
+The default limits are 2 GiB per file, 5 GiB per directory, and three
+concurrent transfers.
 
-1. Windows Terminalから通常どおりUbuntuへSSHする。
-2. Ubuntu上で pi を起動する。
-3. ExplorerからファイルまたはフォルダをPiの入力欄へD&Dする。
-4. 転送完了後、依頼文を書いてEnterする。
+## Usage
 
-入力された C:\... は最終プロンプトへ渡さず、~/.pi/attachments/<session>/<attachment>/ のUbuntuパスへ置換する。
+1. SSH from Windows Terminal into Ubuntu.
+2. Start Pi on Ubuntu.
+3. Drag a file or directory from Explorer into Pi's input editor.
+4. Continue writing the request and press Enter after the transfer is ready.
 
-管理コマンド:
+The Windows path is replaced with a visible attachment placeholder. The final
+model input contains only the Ubuntu-side attachment path, never the original
+Windows path.
+
+Management commands:
 
     /attachments
     /attachments status
@@ -50,12 +83,26 @@ host を省略すると SSH_CONNECTION、次に SSH_CLIENT のclient IPを使う
     /attachments cleanup
     /attachments config
 
-Windows OpenSSH SFTPのドライブパスは /C:/Users/... として送る。Linuxの /mnt/c へは変換しない。
+## Path and transfer behavior
 
-SFTPがsymlinkとして返した項目は追跡しない。読めないdirectory listingはskipせず転送失敗にする。
+- Windows OpenSSH drive paths use the /C:/Users/... namespace.
+- Quoted paths with spaces, Unicode names, and multiple pasted paths are
+  supported.
+- Files are streamed to disk and verified by size after download.
+- Directories are traversed recursively, including hidden files and empty
+  directories.
+- Symlinks reported by SFTP are not followed.
+- Unreadable directory listings fail the attachment instead of being silently
+  omitted.
+- Failed transfers remove partial local data.
+- Attachments use mode 700 directories and mode 600 files.
 
-## 開発チェック
+## Development
 
-    node --experimental-strip-types --test tests/*.test.ts
+Run unit tests:
 
-単体テストはパス解析、SFTP引数、状態復元を確認する。実機確認では、Windows上のファイルをSFTPで取得し、サイズとSHA-256を比較する。
+    npm test
+
+The tests cover Windows path parsing, SFTP argument construction, listing
+parsing, prompt transformation, configuration normalization, cleanup, and
+session restore behavior.
