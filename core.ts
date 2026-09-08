@@ -3,6 +3,21 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { PathError } from "./path-adapters/adapter.ts";
+import {
+	detectPathStyle,
+	parseDroppedPaths,
+	resolvePathAdapter,
+} from "./path-adapters/parser.ts";
+import type {
+	ConfigPathStyle,
+	PathStyle,
+} from "./path-adapters/adapter.ts";
+
+export { detectPathStyle, parseDroppedPaths, resolvePathAdapter } from "./path-adapters/parser.ts";
+export { PosixPathAdapter, posixPathAdapter } from "./path-adapters/posix.ts";
+export { WindowsPathAdapter, windowsPathAdapter } from "./path-adapters/windows.ts";
+export type { ConfigPathStyle, DroppedPathMatch, PathAdapter, PathStyle } from "./path-adapters/parser.ts";
 
 export const DEFAULT_ATTACHMENT_ROOT = join(homedir(), ".pi", "attachments");
 export const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-attachments.json");
@@ -15,28 +30,30 @@ export type AttachmentStatus = "pending" | "connecting" | "uploading" | "ready" 
 export type AttachmentType = "file" | "directory";
 
 export type AttachmentErrorCode =
-	| "WINDOWS_HOST_NOT_FOUND"
-	| "WINDOWS_SSH_UNREACHABLE"
-	| "WINDOWS_AUTH_FAILED"
-	| "WINDOWS_PATH_NOT_FOUND"
-	| "WINDOWS_PERMISSION_DENIED"
+	| "SOURCE_HOST_NOT_FOUND"
+	| "SOURCE_SSH_UNREACHABLE"
+	| "SOURCE_AUTH_FAILED"
+	| "SOURCE_PATH_NOT_FOUND"
+	| "SOURCE_PERMISSION_DENIED"
 	| "SFTP_ERROR"
 	| "DIRECTORY_TOO_LARGE"
 	| "FILE_TOO_LARGE"
 	| "TRANSFER_INTERRUPTED"
 	| "DESTINATION_WRITE_FAILED";
 
-export interface WindowsConfig {
+export interface SourceConfig {
 	host?: string;
 	username?: string;
 	port?: number;
 	identityFile?: string;
 	knownHostsFile?: string;
 	hostKeyAlias?: string;
+	pathStyle?: ConfigPathStyle;
 }
 
 export interface AttachmentConfig {
-	windows: WindowsConfig;
+	source: SourceConfig;
+	sources?: Record<string, SourceConfig>;
 	limits?: {
 		maxFileBytes?: number;
 		maxDirectoryBytes?: number;
@@ -44,22 +61,37 @@ export interface AttachmentConfig {
 	maxParallel?: number;
 }
 
-export interface WindowsRemote {
+export interface SftpResult {
+	stdout: string;
+	stderr: string;
+}
+
+export type SftpRunner = (
+	remote: SourceRemote,
+	commands: string[],
+	signal?: AbortSignal,
+) => Promise<SftpResult>;
+
+export interface SourceRemote {
 	host: string;
 	username: string;
 	port: number;
 	identityFile?: string;
 	knownHostsFile: string;
 	hostKeyAlias?: string;
+	runSftp?: SftpRunner;
 }
 
 export interface Attachment {
 	id: string;
 	sessionId: string;
 	source: {
-		platform: "windows";
 		host: string;
+		username?: string;
+		port?: number;
 		path: string;
+		pathStyle: PathStyle;
+		platform?: "windows" | "macos" | "linux" | "bsd" | "wsl" | "unknown";
 	};
 	name: string;
 	type: AttachmentType;
@@ -72,15 +104,22 @@ export interface Attachment {
 }
 
 export interface PersistedState {
-	version: 1;
+	version: 2;
 	sessionId: string;
 	attachments: Attachment[];
 }
 
-export interface WindowsPathMatch {
-	start: number;
-	end: number;
-	path: string;
+export interface PersistedStateV1 {
+	version: 1;
+	sessionId: string;
+	attachments: Array<Omit<Attachment, "source" | "errorCode"> & {
+		errorCode?: string;
+		 source: {
+			platform: "windows";
+			host: string;
+			path: string;
+		};
+	}>;
 }
 
 export class AttachmentFailure extends Error {
@@ -123,11 +162,6 @@ class SftpProcessError extends Error {
 	}
 }
 
-interface SftpResult {
-	stdout: string;
-	stderr: string;
-}
-
 interface SftpListing {
 	mode: string;
 	size: number;
@@ -157,6 +191,8 @@ interface ManagerOptions {
 	sessionId: string;
 	config: AttachmentConfig;
 	rootDir?: string;
+	env?: Record<string, string | undefined>;
+	runSftp?: SftpRunner;
 	onChange?: (attachments: Attachment[]) => void;
 	onState?: (state: PersistedState) => void;
 }
@@ -171,7 +207,10 @@ function finitePositiveNumber(value: unknown): number | undefined {
 
 function copyConfig(config: AttachmentConfig): AttachmentConfig {
 	return {
-		windows: { ...config.windows },
+		source: { ...config.source },
+		sources: config.sources
+			? Object.fromEntries(Object.entries(config.sources).map(([name, source]) => [name, { ...source }]))
+			: undefined,
 		limits: config.limits ? { ...config.limits } : undefined,
 		maxParallel: config.maxParallel,
 	};
@@ -179,10 +218,11 @@ function copyConfig(config: AttachmentConfig): AttachmentConfig {
 
 export function defaultConfig(): AttachmentConfig {
 	return {
-		windows: {
+		source: {
 			port: 22,
-			identityFile: "~/.ssh/pi_windows_attachment",
+			identityFile: "~/.ssh/pi_remote_attachment",
 			knownHostsFile: "~/.ssh/known_hosts",
+			pathStyle: "auto",
 		},
 		limits: {
 			maxFileBytes: DEFAULT_MAX_FILE_BYTES,
@@ -195,27 +235,46 @@ export function defaultConfig(): AttachmentConfig {
 export function normalizeConfig(value: unknown): AttachmentConfig {
 	const defaults = defaultConfig();
 	if (!isRecord(value)) return defaults;
-	const windows = isRecord(value.windows) ? value.windows : {};
+	const hasSource = isRecord(value.source);
+	const legacyWindows = !hasSource && isRecord(value.windows);
+	const rawSource = hasSource ? value.source : legacyWindows ? value.windows : {};
+	const sourceDefaults: SourceConfig = legacyWindows
+		? { ...defaults.source, identityFile: "~/.ssh/pi_windows_attachment", pathStyle: "windows" }
+		: { ...defaults.source };
+	const source = isRecord(rawSource) ? rawSource : {};
 	const limits = isRecord(value.limits) ? value.limits : {};
 	const config: AttachmentConfig = {
-		windows: { ...defaults.windows },
+		source: sourceDefaults,
 		limits: { ...defaults.limits },
 		maxParallel: defaults.maxParallel,
 	};
 	for (const key of ["host", "username", "identityFile", "knownHostsFile", "hostKeyAlias"] as const) {
-		if (typeof windows[key] === "string" && windows[key].trim()) {
-			config.windows[key] = windows[key].trim();
+		if (typeof source[key] === "string" && source[key].trim()) {
+			config.source[key] = source[key].trim();
 		}
 	}
-	const port = finitePositiveNumber(windows.port);
+	const pathStyle = source.pathStyle;
+	if (pathStyle === "auto" || pathStyle === "windows" || pathStyle === "posix") {
+		config.source.pathStyle = pathStyle;
+	}
+	const port = finitePositiveNumber(source.port);
 	const maxFileBytes = finitePositiveNumber(limits.maxFileBytes);
 	const maxDirectoryBytes = finitePositiveNumber(limits.maxDirectoryBytes);
 	const maxParallel = finitePositiveNumber(value.maxParallel);
-	if (port !== undefined) config.windows.port = port;
+	if (port !== undefined) config.source.port = port;
 	if (maxFileBytes !== undefined) config.limits!.maxFileBytes = maxFileBytes;
 	if (maxDirectoryBytes !== undefined) config.limits!.maxDirectoryBytes = maxDirectoryBytes;
 	if (maxParallel !== undefined) {
 		config.maxParallel = Math.min(Math.floor(maxParallel), 16);
+	}
+	if (isRecord(value.sources)) {
+		const sources: Record<string, SourceConfig> = {};
+		for (const [name, rawProfile] of Object.entries(value.sources)) {
+			if (!isRecord(rawProfile)) continue;
+			const profile = normalizeConfig({ source: rawProfile }).source;
+			sources[name] = profile;
+		}
+		if (Object.keys(sources).length > 0) config.sources = sources;
 	}
 	return config;
 }
@@ -264,33 +323,47 @@ function isSafeHost(value: string): boolean {
 function assertSafeHost(value: string, label: string): string {
 	const host = value.trim();
 	if (!host || !isSafeHost(host)) {
-		throw new AttachmentFailure("WINDOWS_HOST_NOT_FOUND", "Invalid Windows " + label);
+		throw new AttachmentFailure("SOURCE_HOST_NOT_FOUND", "Invalid source " + label);
 	}
 	return host;
 }
 
-export function resolveWindowsRemote(
+export function resolveSourceConfig(
 	config: AttachmentConfig,
 	env: Record<string, string | undefined> = process.env,
-): WindowsRemote {
-	const host = config.windows.host?.trim() || detectClientHost(env);
+): SourceConfig {
+	const clientHost = detectClientHost(env);
+	if (!clientHost || !config.sources) return config.source;
+	const matches = Object.values(config.sources).filter((source) => source.host?.trim() === clientHost);
+	if (matches.length > 1) {
+		throw new AttachmentFailure("SOURCE_HOST_NOT_FOUND", "Multiple source profiles match SSH client " + clientHost);
+	}
+	return matches[0] || config.source;
+}
+
+export function resolveSourceRemote(
+	config: AttachmentConfig,
+	env: Record<string, string | undefined> = process.env,
+): SourceRemote {
+	const source = resolveSourceConfig(config, env);
+	const host = source.host?.trim() || detectClientHost(env);
 	if (!host) {
 		throw new AttachmentFailure(
-			"WINDOWS_HOST_NOT_FOUND",
-			"Windows host is not configured and SSH_CONNECTION is unavailable",
+			"SOURCE_HOST_NOT_FOUND",
+			"Source host is not configured and SSH_CONNECTION is unavailable",
 		);
 	}
-	const username = config.windows.username?.trim();
+	const username = source.username?.trim();
 	if (!username || !/^[A-Za-z0-9._-]+$/.test(username)) {
-		throw new AttachmentFailure("WINDOWS_AUTH_FAILED", "Windows SSH username is not configured");
+		throw new AttachmentFailure("SOURCE_AUTH_FAILED", "Source SSH username is not configured");
 	}
-	const port = config.windows.port ?? 22;
+	const port = source.port ?? 22;
 	if (!Number.isInteger(port) || port < 1 || port > 65535) {
-		throw new AttachmentFailure("SFTP_ERROR", "Windows SSH port is invalid");
+		throw new AttachmentFailure("SFTP_ERROR", "Source SSH port is invalid");
 	}
-	const knownHostsFile = expandHomePath(config.windows.knownHostsFile || "~/.ssh/known_hosts");
-	const identityFile = config.windows.identityFile
-		? expandHomePath(config.windows.identityFile)
+	const knownHostsFile = expandHomePath(source.knownHostsFile || "~/.ssh/known_hosts");
+	const identityFile = source.identityFile
+		? expandHomePath(source.identityFile)
 		: undefined;
 	return {
 		host: assertSafeHost(host, "host"),
@@ -298,43 +371,10 @@ export function resolveWindowsRemote(
 		port,
 		identityFile,
 		knownHostsFile,
-		hostKeyAlias: config.windows.hostKeyAlias
-			? assertSafeHost(config.windows.hostKeyAlias, "host-key alias")
+		hostKeyAlias: source.hostKeyAlias
+			? assertSafeHost(source.hostKeyAlias, "host-key alias")
 			: undefined,
 	};
-}
-
-export function isWindowsAbsolutePath(value: string): boolean {
-	const path = value.trim();
-	if (!/^[A-Za-z]:[\\/]/.test(path)) return false;
-	const rest = path.slice(2);
-	const normalizedRest = rest.replaceAll("\\", "/");
-	return !/[\u0000-\u001f<>:"|?*]/.test(rest) &&
-		!normalizedRest.split("/").some((part) => part === "." || part === "..");
-}
-
-export function normalizeWindowsPath(value: string): string {
-	const path = value.trim();
-	if (!isWindowsAbsolutePath(path)) {
-		throw new AttachmentFailure("WINDOWS_PATH_NOT_FOUND", "Not a valid Windows absolute path");
-	}
-	const normalized = path.replaceAll("\\", "/");
-	const rest = normalized.slice(2);
-	if (rest.split("/").some((part) => part === "." || part === "..")) {
-		throw new AttachmentFailure("WINDOWS_PATH_NOT_FOUND", "Windows path contains a traversal segment");
-	}
-	return normalized[0].toUpperCase() + ":" + (rest.startsWith("/") ? rest : "/" + rest);
-}
-
-export function windowsPathToSftpPath(value: string): string {
-	const normalized = normalizeWindowsPath(value);
-	return "/" + normalized;
-}
-
-export function windowsPathBasename(value: string): string {
-	const normalized = normalizeWindowsPath(value).replace(/\/+$/, "");
-	const slash = normalized.lastIndexOf("/");
-	return slash >= 0 ? normalized.slice(slash + 1) || normalized.slice(0, 2) : normalized;
 }
 
 export function sanitizeName(value: string): string {
@@ -343,37 +383,12 @@ export function sanitizeName(value: string): string {
 	return sanitized.slice(0, 240);
 }
 
-export function parseWindowsPaths(text: string): WindowsPathMatch[] {
-	const matches: WindowsPathMatch[] = [];
-	const occupied: Array<{ start: number; end: number }> = [];
-	const quoted = /"([^"\r\n]*)"/g;
-	for (const match of text.matchAll(quoted)) {
-		const path = match[1];
-		const start = match.index ?? 0;
-		if (isWindowsAbsolutePath(path)) {
-			matches.push({ start, end: start + match[0].length, path });
-			occupied.push({ start, end: start + match[0].length });
-		}
-	}
-	const unquoted = /[A-Za-z]:[\\/][^\s"'<>|?*]*/g;
-	for (const match of text.matchAll(unquoted)) {
-		const start = match.index ?? 0;
-		const previous = text[start - 1];
-		if (previous && /[A-Za-z0-9_/:.-]/.test(previous)) continue;
-		const end = start + match[0].length;
-		if (/[<>|?*":]/.test(text[end] || "")) continue;
-		if (occupied.some((range) => start < range.end && end > range.start)) continue;
-		if (isWindowsAbsolutePath(match[0])) matches.push({ start, end, path: match[0] });
-	}
-	return matches.sort((a, b) => a.start - b.start);
-}
-
 export function quoteSftpArgument(value: string): string {
 	if (/[\u0000\r\n]/.test(value)) throw new Error("SFTP argument contains a control character");
 	return '"' + value.replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"';
 }
 
-export function buildSftpArgs(remote: WindowsRemote): string[] {
+export function buildSftpArgs(remote: SourceRemote): string[] {
 	const targetHost = remote.host.includes(":") && !remote.host.startsWith("[")
 		? "[" + remote.host + "]"
 		: remote.host;
@@ -410,7 +425,7 @@ function appendOutput(current: string, chunk: Buffer, limit: number): string {
 	return current + chunk.subarray(0, remaining).toString("utf8");
 }
 
-async function assertSftpFiles(remote: WindowsRemote): Promise<void> {
+async function assertSftpFiles(remote: SourceRemote): Promise<void> {
 	try {
 		const knownHosts = await statFile(remote.knownHostsFile);
 		if (!knownHosts.isFile()) throw new Error("not a file");
@@ -422,13 +437,13 @@ async function assertSftpFiles(remote: WindowsRemote): Promise<void> {
 			const identity = await statFile(remote.identityFile);
 			if (!identity.isFile()) throw new Error("not a file");
 		} catch {
-			throw new AttachmentFailure("WINDOWS_AUTH_FAILED", "Windows SSH identity file is missing");
+			throw new AttachmentFailure("SOURCE_AUTH_FAILED", "Source SSH identity file is missing");
 		}
 	}
 }
 
 export async function runSftpBatch(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	commands: string[],
 	signal?: AbortSignal,
 ): Promise<SftpResult> {
@@ -485,24 +500,24 @@ export function classifyFailure(error: unknown): AttachmentFailure {
 	const text = failureText(error);
 	const lower = text.toLowerCase();
 	if (/could not resolve hostname|name or service not known|no address associated/.test(lower)) {
-		return new AttachmentFailure("WINDOWS_HOST_NOT_FOUND", "Windows SSH host was not found");
+		return new AttachmentFailure("SOURCE_HOST_NOT_FOUND", "Source SSH host was not found");
 	}
 	if (/permission denied \(publickey\)|authentication failed|no supported authentication/.test(lower)) {
-		return new AttachmentFailure("WINDOWS_AUTH_FAILED", "Windows SSH authentication failed");
+		return new AttachmentFailure("SOURCE_AUTH_FAILED", "Source SSH authentication failed");
 	}
 	if (/host key verification failed|offending .* key|remote host identification/.test(lower)) {
-		return new AttachmentFailure("SFTP_ERROR", "Windows SSH host key is not trusted");
+		return new AttachmentFailure("SFTP_ERROR", "Source SSH host key is not trusted");
 	}
 	if (/no such file|not found|cannot ls/.test(lower)) {
-		return new AttachmentFailure("WINDOWS_PATH_NOT_FOUND", "Windows path was not found");
+		return new AttachmentFailure("SOURCE_PATH_NOT_FOUND", "Source path was not found");
 	}
 	if (/permission denied|access denied/.test(lower)) {
-		return new AttachmentFailure("WINDOWS_PERMISSION_DENIED", "Windows path access was denied");
+		return new AttachmentFailure("SOURCE_PERMISSION_DENIED", "Source path access was denied");
 	}
 	if (/connection refused|connection timed out|connect to host|no route to host|connection closed|broken pipe|kex_exchange/.test(lower)) {
-		return new AttachmentFailure("WINDOWS_SSH_UNREACHABLE", "Windows SSH is unreachable");
+		return new AttachmentFailure("SOURCE_SSH_UNREACHABLE", "Source SSH is unreachable");
 	}
-	return new AttachmentFailure("SFTP_ERROR", "Windows SFTP transfer failed");
+	return new AttachmentFailure("SFTP_ERROR", "Source SFTP transfer failed");
 }
 
 function isReconnectable(error: unknown): boolean {
@@ -511,15 +526,16 @@ function isReconnectable(error: unknown): boolean {
 }
 
 async function runSftpWithReconnect(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	commands: string[],
 	signal?: AbortSignal,
 ): Promise<SftpResult> {
+	const run = remote.runSftp || runSftpBatch;
 	try {
-		return await runSftpBatch(remote, commands, signal);
+		return await run(remote, commands, signal);
 	} catch (error) {
 		if (signal?.aborted || !isReconnectable(error)) throw error;
-		return await runSftpBatch(remote, commands, signal);
+		return await run(remote, commands, signal);
 	}
 }
 
@@ -534,19 +550,19 @@ export function parseSftpListings(output: string): SftpListing[] {
 }
 
 function remoteJoin(parent: string, name: string): string {
-	if (!name || name === "." || name === ".." || /[\\/]/.test(name)) {
-		throw new AttachmentFailure("SFTP_ERROR", "Windows directory contains an unsafe name");
+	if (!name || name === "." || name === ".." || name.includes("/")) {
+		throw new AttachmentFailure("SFTP_ERROR", "Source directory contains an unsafe name");
 	}
 	return parent.replace(/\/+$/, "") + "/" + name;
 }
 
 function listingName(value: string): string {
-	const slash = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+	const slash = value.lastIndexOf("/");
 	return slash >= 0 ? value.slice(slash + 1) : value;
 }
 
 async function remoteStat(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	remotePath: string,
 	signal?: AbortSignal,
 ): Promise<{ type: "file" | "directory" | "symlink" | "other"; size: number }> {
@@ -584,7 +600,7 @@ async function remoteStat(
 }
 
 async function listRemoteDirectory(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	remotePath: string,
 	signal?: AbortSignal,
 ): Promise<RemoteEntry[]> {
@@ -599,13 +615,12 @@ async function listRemoteDirectory(
 	}
 	const byName = new Map<string, RemoteEntry>();
 	for (const listing of parseSftpListings(result.stdout)) {
+		if (listing.mode[0] === "l") continue;
 		const name = listingName(listing.name);
 		if (name === "." || name === ".." || byName.has(name)) continue;
 		const type = listing.mode[0] === "d"
 			? "directory"
-			: listing.mode[0] === "l"
-				? "symlink"
-				: listing.mode[0] === "-"
+			: listing.mode[0] === "-"
 					? "file"
 					: "other";
 		byName.set(name, { name, type, size: listing.size, remotePath: remoteJoin(remotePath, name) });
@@ -614,7 +629,7 @@ async function listRemoteDirectory(
 }
 
 async function walkRemoteDirectory(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	root: string,
 	signal: AbortSignal,
 ): Promise<RemoteTree> {
@@ -643,7 +658,7 @@ async function walkRemoteDirectory(
 }
 
 async function downloadFiles(
-	remote: WindowsRemote,
+	remote: SourceRemote,
 	files: Array<{ remotePath: string; localPath: string }>,
 	signal: AbortSignal,
 ): Promise<void> {
@@ -686,12 +701,15 @@ function cloneAttachment(attachment: Attachment): Attachment {
 export class AttachmentManager {
 	private readonly rootDir: string;
 	private readonly sessionId: string;
+	private readonly env: Record<string, string | undefined>;
+	private readonly runSftp?: SftpRunner;
 	private config: AttachmentConfig;
 	private readonly attachments: Attachment[] = [];
 	private readonly queue: Attachment[] = [];
 	private readonly settled = new Map<string, { promise: Promise<Attachment>; resolve: (value: Attachment) => void }>();
 	private readonly active = new Map<string, AbortController>();
 	private readonly running = new Map<string, Promise<void>>();
+	private readonly sourceRemotes = new Map<string, SourceRemote>();
 	private readonly removed = new Set<string>();
 	private metadataWrite: Promise<void> = Promise.resolve();
 	private pumping = false;
@@ -702,7 +720,9 @@ export class AttachmentManager {
 	constructor(options: ManagerOptions) {
 		this.rootDir = expandHomePath(options.rootDir || DEFAULT_ATTACHMENT_ROOT);
 		this.sessionId = options.sessionId;
-		this.config = copyConfig(options.config);
+		this.env = options.env || process.env;
+		this.runSftp = options.runSftp;
+		this.config = normalizeConfig(options.config);
 		this.onChange = options.onChange;
 		this.onState = options.onState;
 	}
@@ -724,25 +744,66 @@ export class AttachmentManager {
 	}
 
 	setConfig(config: AttachmentConfig): void {
-		this.config = copyConfig(config);
+		this.config = normalizeConfig(config);
 		this.emit();
 	}
 
 	add(sourcePath: string): Attachment {
-		const normalized = normalizeWindowsPath(sourcePath);
-		const existing = [...this.attachments].reverse().find((attachment) => attachment.source.path.toLowerCase() === normalized.toLowerCase());
+		const source = resolveSourceConfig(this.config, this.env);
+		let sourceRemote: SourceRemote | undefined;
+		try {
+			sourceRemote = resolveSourceRemote(this.config, this.env);
+			if (this.runSftp) sourceRemote = { ...sourceRemote, runSftp: this.runSftp };
+		} catch {
+			// Transfer reports configuration errors through attachment state.
+		}
+		const sourceHost = sourceRemote?.host || source.host?.trim() || detectClientHost(this.env) || "";
+		const sourceUsername = sourceRemote?.username || source.username?.trim();
+		const sourcePort = sourceRemote?.port ||
+			(typeof source.port === "number" && Number.isInteger(source.port) && source.port >= 1 && source.port <= 65535
+				? source.port
+				: undefined);
+		const configuredStyle = source.pathStyle || "auto";
+		const style = configuredStyle === "auto" ? detectPathStyle(sourcePath) : configuredStyle;
+		if (!style) throw new AttachmentFailure("SOURCE_PATH_NOT_FOUND", "Not a valid absolute source path");
+		const adapter = resolvePathAdapter(style);
+		let normalized: string;
+		try {
+			normalized = adapter.normalize(sourcePath);
+		} catch (error) {
+			if (error instanceof PathError) {
+				throw new AttachmentFailure("SOURCE_PATH_NOT_FOUND", error.message);
+			}
+			throw error;
+		}
+		const existing = [...this.attachments].reverse().find((attachment) =>
+			attachment.source.host.toLowerCase() === sourceHost.toLowerCase() &&
+			attachment.source.username === sourceUsername &&
+			attachment.source.port === sourcePort &&
+			attachment.source.pathStyle === style &&
+			(style === "windows"
+				? attachment.source.path.toLowerCase() === normalized.toLowerCase()
+				: attachment.source.path === normalized),
+		);
 		if (existing) return cloneAttachment(existing);
-		const name = sanitizeName(windowsPathBasename(normalized));
+		const name = sanitizeName(adapter.basename(normalized));
 		const attachment: Attachment = {
 			id: randomUUID(),
 			sessionId: this.sessionId,
-			source: { platform: "windows", host: "", path: normalized },
+			source: {
+				host: sourceHost,
+				username: sourceUsername,
+				port: sourcePort,
+				path: normalized,
+				pathStyle: style,
+			},
 			name,
 			type: "file",
 			status: "pending",
 			placeholder: "[" + name + "]",
 		};
 		this.attachments.push(attachment);
+		if (sourceRemote) this.sourceRemotes.set(attachment.id, sourceRemote);
 		this.settled.set(attachment.id, deferred<Attachment>());
 		this.persist();
 		this.queue.push(attachment);
@@ -750,8 +811,12 @@ export class AttachmentManager {
 		return cloneAttachment(attachment);
 	}
 
-	replacePastedText(text: string): string {
-		const matches = parseWindowsPaths(text);
+	replacePastedText(text: string, options: { allowPosix?: boolean } = {}): string {
+		const source = resolveSourceConfig(this.config, this.env);
+		const matches = parseDroppedPaths(text, {
+			pathStyle: source.pathStyle || "auto",
+			allowPosix: options.allowPosix,
+		});
 		let result = text;
 		for (let index = matches.length - 1; index >= 0; index--) {
 			const match = matches[index];
@@ -838,17 +903,19 @@ export class AttachmentManager {
 		return sections.join("\n\n");
 	}
 
-	async restore(state: PersistedState | undefined): Promise<void> {
-		if (!state || state.version !== 1 || state.sessionId !== this.sessionId || !Array.isArray(state.attachments)) {
+	async restore(state: PersistedState | PersistedStateV1 | undefined): Promise<void> {
+		const migrated = migratePersistedState(state);
+		if (!migrated || migrated.sessionId !== this.sessionId) {
 			return;
 		}
-		let currentHost: string | undefined;
+		let currentRemote: SourceRemote | undefined;
 		try {
-			currentHost = resolveWindowsRemote(this.config).host;
+			currentRemote = resolveSourceRemote(this.config, this.env);
+			if (this.runSftp) currentRemote = { ...currentRemote, runSftp: this.runSftp };
 		} catch {
-			currentHost = undefined;
+			currentRemote = undefined;
 		}
-		for (const raw of state.attachments) {
+		for (const raw of migrated.attachments) {
 			if (!isRestorableAttachment(raw, this.sessionId)) continue;
 			const attachment = cloneAttachment(raw);
 			attachment.name = sanitizeName(attachment.name);
@@ -857,28 +924,42 @@ export class AttachmentManager {
 			const expected = join(root, attachment.name);
 			ensureInside(root, expected);
 			attachment.destinationPath = expected;
-			if (currentHost && attachment.source.host && attachment.source.host !== currentHost) {
+			if (currentRemote && attachment.source.host &&
+				attachment.source.host.toLowerCase() !== currentRemote.host.toLowerCase()) {
 				attachment.status = "failed";
-				attachment.errorCode = "WINDOWS_HOST_NOT_FOUND";
-				attachment.error = "Windows host changed; retry attachment";
-			} else if (attachment.status === "ready") {
-				try {
-					const local = await statFile(expected);
-					if (attachment.type === "file" && attachment.size !== undefined && local.size !== attachment.size) {
-						throw new Error("size mismatch");
+				attachment.errorCode = "SOURCE_HOST_NOT_FOUND";
+				attachment.error = "Source host changed; retry attachment";
+			} else if (currentRemote &&
+				((attachment.source.username !== undefined && attachment.source.username !== currentRemote.username) ||
+					(attachment.source.port !== undefined && attachment.source.port !== currentRemote.port))) {
+				attachment.status = "failed";
+				attachment.errorCode = "SOURCE_AUTH_FAILED";
+				attachment.error = "Source connection changed; retry attachment";
+			} else {
+				if (currentRemote) {
+					attachment.source.username ??= currentRemote.username;
+					attachment.source.port ??= currentRemote.port;
+				}
+				if (attachment.status === "ready") {
+					try {
+						const local = await statFile(expected);
+						if (attachment.type === "file" && attachment.size !== undefined && local.size !== attachment.size) {
+							throw new Error("size mismatch");
+						}
+						if (attachment.type === "file" && !local.isFile()) throw new Error("not a file");
+						if (attachment.type === "directory" && !local.isDirectory()) throw new Error("not a directory");
+					} catch {
+						attachment.status = "failed";
+						attachment.errorCode = "TRANSFER_INTERRUPTED";
+						attachment.error = "Attachment data is missing; retry attachment";
 					}
-					if (attachment.type === "file" && !local.isFile()) throw new Error("not a file");
-					if (attachment.type === "directory" && !local.isDirectory()) throw new Error("not a directory");
-				} catch {
+				} else {
 					attachment.status = "failed";
 					attachment.errorCode = "TRANSFER_INTERRUPTED";
-					attachment.error = "Attachment data is missing; retry attachment";
+					attachment.error = "Previous transfer did not finish; retry attachment";
 				}
-			} else {
-				attachment.status = "failed";
-				attachment.errorCode = "TRANSFER_INTERRUPTED";
-				attachment.error = "Previous transfer did not finish; retry attachment";
 			}
+			if (currentRemote && attachment.status !== "failed") this.sourceRemotes.set(attachment.id, currentRemote);
 			this.attachments.push(attachment);
 			const promise = deferred<Attachment>();
 			this.settled.set(attachment.id, promise);
@@ -892,6 +973,7 @@ export class AttachmentManager {
 		if (index < 0) return false;
 		const [attachment] = this.attachments.splice(index, 1);
 		this.removed.add(attachment.id);
+		this.sourceRemotes.delete(attachment.id);
 		this.queue.splice(0, this.queue.length, ...this.queue.filter((item) => item.id !== attachment.id));
 		this.active.get(attachment.id)?.abort();
 		await rm(attachmentRoot(this.rootDir, this.sessionId, attachment.id), { recursive: true, force: true });
@@ -905,12 +987,12 @@ export class AttachmentManager {
 		const attachment = this.attachments[index];
 		if (attachment.status !== "failed") return false;
 		this.removed.delete(attachment.id);
+		this.sourceRemotes.delete(attachment.id);
 		this.settled.set(attachment.id, deferred<Attachment>());
 		attachment.status = "pending";
 		attachment.error = undefined;
 		attachment.errorCode = undefined;
 		attachment.destinationPath = undefined;
-		attachment.source.host = "";
 		this.persist();
 		this.queue.push(attachment);
 		void this.pump();
@@ -942,7 +1024,7 @@ export class AttachmentManager {
 
 	serialize(): PersistedState {
 		return {
-			version: 1,
+			version: 2,
 			sessionId: this.sessionId,
 			attachments: this.list(),
 		};
@@ -1017,15 +1099,29 @@ export class AttachmentManager {
 		const root = attachmentRoot(this.rootDir, this.sessionId, attachment.id);
 		try {
 			this.update(attachment, { status: "connecting", error: undefined, errorCode: undefined });
-			const remote = resolveWindowsRemote(this.config);
+			const resolved = this.sourceRemotes.get(attachment.id) || resolveSourceRemote(this.config, this.env);
+			const remote = this.runSftp && !resolved.runSftp
+				? { ...resolved, runSftp: this.runSftp }
+				: resolved;
+			this.sourceRemotes.set(attachment.id, remote);
 			attachment.source.host = remote.host;
-			const sourcePath = windowsPathToSftpPath(attachment.source.path);
+			attachment.source.username = remote.username;
+			attachment.source.port = remote.port;
+			let sourcePath: string;
+			try {
+				sourcePath = resolvePathAdapter(attachment.source.pathStyle).toSftpPath(attachment.source.path);
+			} catch (error) {
+				if (error instanceof PathError) {
+					throw new AttachmentFailure("SOURCE_PATH_NOT_FOUND", error.message);
+				}
+				throw error;
+			}
 			const source = await remoteStat(remote, sourcePath, signal);
 			if (source.type === "symlink") {
-				throw new AttachmentFailure("SFTP_ERROR", "Windows symlink or junction is not supported");
+				throw new AttachmentFailure("SFTP_ERROR", "Source symlink or junction is not supported");
 			}
 			if (source.type !== "file" && source.type !== "directory") {
-				throw new AttachmentFailure("SFTP_ERROR", "Windows path is not a regular file or directory");
+				throw new AttachmentFailure("SFTP_ERROR", "Source path is not a regular file or directory");
 			}
 			attachment.type = source.type;
 			if (source.type === "file") {
@@ -1060,7 +1156,7 @@ export class AttachmentManager {
 	}
 
 	private async materializeFile(
-		remote: WindowsRemote,
+		remote: SourceRemote,
 		attachment: Attachment,
 		sourcePath: string,
 		size: number,
@@ -1075,7 +1171,7 @@ export class AttachmentManager {
 		await downloadFiles(remote, [{ remotePath: sourcePath, localPath: temporary }], signal);
 		const actual = await statFile(temporary);
 		if (!actual.isFile() || actual.size !== size) {
-			throw new AttachmentFailure("TRANSFER_INTERRUPTED", "Downloaded file size does not match Windows source");
+			throw new AttachmentFailure("TRANSFER_INTERRUPTED", "Downloaded file size does not match source");
 		}
 		await chmod(temporary, 0o600);
 		await rename(temporary, finalPath);
@@ -1084,7 +1180,7 @@ export class AttachmentManager {
 	}
 
 	private async materializeDirectory(
-		remote: WindowsRemote,
+		remote: SourceRemote,
 		attachment: Attachment,
 		tree: RemoteTree,
 		root: string,
@@ -1112,7 +1208,7 @@ export class AttachmentManager {
 			const local = join(temporary, ...file.relativePath.split("/").map(sanitizeName));
 			const actual = await statFile(local);
 			if (!actual.isFile() || actual.size !== file.size) {
-				throw new AttachmentFailure("TRANSFER_INTERRUPTED", "Downloaded directory file size does not match Windows source");
+				throw new AttachmentFailure("TRANSFER_INTERRUPTED", "Downloaded directory file size does not match source");
 			}
 			await chmod(local, 0o600);
 		}
@@ -1122,11 +1218,65 @@ export class AttachmentManager {
 	}
 }
 
+const persistedErrorCodeMap: Record<string, AttachmentErrorCode> = {
+	WINDOWS_HOST_NOT_FOUND: "SOURCE_HOST_NOT_FOUND",
+	WINDOWS_SSH_UNREACHABLE: "SOURCE_SSH_UNREACHABLE",
+	WINDOWS_AUTH_FAILED: "SOURCE_AUTH_FAILED",
+	WINDOWS_PATH_NOT_FOUND: "SOURCE_PATH_NOT_FOUND",
+	WINDOWS_PERMISSION_DENIED: "SOURCE_PERMISSION_DENIED",
+};
+
+function migratePersistedAttachment(value: unknown, version: 1 | 2): Attachment | undefined {
+	if (!isRecord(value) || !isRecord(value.source)) return undefined;
+	const source = value.source;
+	if (version === 1 && source.platform !== "windows") return undefined;
+	const pathStyle = version === 1
+		? "windows"
+		: source.pathStyle === "windows" || source.pathStyle === "posix"
+			? source.pathStyle
+			: source.platform === "windows"
+				? "windows"
+				: undefined;
+	if (!pathStyle) return undefined;
+	const errorCode = typeof value.errorCode === "string"
+		? persistedErrorCodeMap[value.errorCode] || (value.errorCode as AttachmentErrorCode)
+		: undefined;
+	return {
+		...(value as unknown as Attachment),
+		source: { ...(source as unknown as Attachment["source"]), pathStyle },
+		errorCode,
+	};
+}
+
+export function migratePersistedState(value: unknown): PersistedState | undefined {
+	if (!isRecord(value) || (value.version !== 1 && value.version !== 2) ||
+		typeof value.sessionId !== "string" || !Array.isArray(value.attachments)) {
+		return undefined;
+	}
+	const version = value.version as 1 | 2;
+	return {
+		version: 2,
+		sessionId: value.sessionId,
+		attachments: value.attachments
+			.map((attachment) => migratePersistedAttachment(attachment, version))
+			.filter((attachment): attachment is Attachment => attachment !== undefined),
+	};
+}
+
 function isRestorableAttachment(value: unknown, sessionId: string): value is Attachment {
 	if (!isRecord(value)) return false;
 	if (value.sessionId !== sessionId || typeof value.id !== "string" || !/^[0-9a-f-]{16,}$/i.test(value.id)) return false;
-	if (!isRecord(value.source) || value.source.platform !== "windows" || typeof value.source.path !== "string") return false;
-	if (!isWindowsAbsolutePath(value.source.path) || typeof value.name !== "string") return false;
+	if (!isRecord(value.source) || typeof value.source.host !== "string" || typeof value.source.path !== "string") return false;
+	if (value.source.pathStyle !== "windows" && value.source.pathStyle !== "posix") return false;
+	if (!resolvePathAdapter(value.source.pathStyle).isAbsolutePath(value.source.path) || typeof value.name !== "string") return false;
+	if (value.source.username !== undefined &&
+		(typeof value.source.username !== "string" || !/^[A-Za-z0-9._-]+$/.test(value.source.username))) return false;
+	const port = value.source.port;
+	if (port !== undefined &&
+		(typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)) return false;
+	const platform = value.source.platform;
+	if (platform !== undefined && typeof platform !== "string") return false;
+	if (typeof platform === "string" && !["windows", "macos", "linux", "bsd", "wsl", "unknown"].includes(platform)) return false;
 	if (value.type !== "file" && value.type !== "directory") return false;
 	if (!["pending", "connecting", "uploading", "ready", "failed"].includes(String(value.status))) return false;
 	return typeof value.placeholder === "string" || value.placeholder === undefined;

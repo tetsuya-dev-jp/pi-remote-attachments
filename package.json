@@ -1,7 +1,7 @@
 {
   "name": "pi-remote-attachments",
   "version": "0.1.0",
-  "description": "Pull Windows files into Pi on Ubuntu over OpenSSH SFTP",
+  "description": "Pull files into Pi from an SSH source over OpenSSH SFTP",
   "type": "module",
   "keywords": [
     "pi-package",

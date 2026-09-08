@@ -1,5 +1,6 @@
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BracketedPasteTransformer } from "./editor.ts";
 import {
 	AttachmentManager,
 	type Attachment,
@@ -8,21 +9,20 @@ import {
 	SESSION_STATE_ENTRY_TYPE,
 	detectClientHost,
 	loadConfig,
-	parseWindowsPaths,
-	resolveWindowsRemote,
+	migratePersistedState,
+	resolveSourceConfig,
+	resolveSourceRemote,
 	saveConfig,
 } from "./core.ts";
 
 const STATUS_ID = "pi-remote-attachments";
 const WIDGET_ID = "pi-remote-attachments";
-const START_PASTE = "\x1b[200~";
-const END_PASTE = "\x1b[201~";
 
 type CustomEditorArguments = ConstructorParameters<typeof CustomEditor>;
-type ReplacePastedText = (text: string) => string;
+type ReplacePastedText = (text: string, options?: { allowPosix?: boolean }) => string;
 
 class AttachmentEditor extends CustomEditor {
-	private attachmentPasteBuffer: string | undefined;
+	private readonly pasteTransformer = new BracketedPasteTransformer();
 	private readonly replacePastedText: ReplacePastedText;
 
 	constructor(
@@ -36,24 +36,8 @@ class AttachmentEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		const start = data.indexOf(START_PASTE);
-		if (this.attachmentPasteBuffer !== undefined || start >= 0) {
-			if (this.attachmentPasteBuffer === undefined) {
-				if (start > 0) super.handleInput(this.replacePastedText(data.slice(0, start)));
-				this.attachmentPasteBuffer = data.slice(start + START_PASTE.length);
-			} else {
-				this.attachmentPasteBuffer += data;
-			}
-			const end = this.attachmentPasteBuffer.indexOf(END_PASTE);
-			if (end < 0) return;
-			const content = this.attachmentPasteBuffer.slice(0, end);
-			const remaining = this.attachmentPasteBuffer.slice(end + END_PASTE.length);
-			this.attachmentPasteBuffer = undefined;
-			super.handleInput(START_PASTE + this.replacePastedText(content) + END_PASTE);
-			if (remaining) this.handleInput(remaining);
-			return;
-		}
-		super.handleInput(this.replacePastedText(data));
+		const transformed = this.pasteTransformer.transform(data, this.replacePastedText);
+		if (transformed) super.handleInput(transformed);
 	}
 }
 
@@ -61,19 +45,12 @@ let manager: AttachmentManager | undefined;
 let currentContext: ExtensionContext | undefined;
 let currentConfig: AttachmentConfig | undefined;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 function loadPersistedState(ctx: ExtensionContext): PersistedState | undefined {
 	const branch = ctx.sessionManager.getBranch();
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index] as { type?: string; customType?: string; data?: unknown };
 		if (entry.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY_TYPE) continue;
-		if (!isRecord(entry.data) || entry.data.version !== 1 || !Array.isArray(entry.data.attachments)) {
-			return undefined;
-		}
-		return entry.data as unknown as PersistedState;
+		return migratePersistedState(entry.data);
 	}
 	return undefined;
 }
@@ -124,26 +101,28 @@ async function configure(args: string, ctx: ExtensionContext): Promise<void> {
 			notify(ctx, "Setup requires interactive UI", "warning");
 			return;
 		}
-		const host = await ctx.ui.input("Windows SSH host", currentConfig.windows.host || detectClientHost() || "");
-		const username = await ctx.ui.input("Windows SSH username", currentConfig.windows.username || "");
+		const host = await ctx.ui.input("Source SSH host", currentConfig.source.host || detectClientHost() || "");
+		const username = await ctx.ui.input("Source SSH username", currentConfig.source.username || "");
 		const identityFile = await ctx.ui.input(
 			"SSH identity file",
-			currentConfig.windows.identityFile || "~/.ssh/pi_windows_attachment",
+			currentConfig.source.identityFile || "~/.ssh/pi_remote_attachment",
 		);
-		if (!host || !username || !identityFile) {
+		const pathStyle = await ctx.ui.select("Path style", ["auto", "windows", "posix"]);
+		if (!host || !username || !identityFile || !pathStyle) {
 			notify(ctx, "Setup cancelled", "warning");
 			return;
 		}
-		currentConfig.windows.host = host.trim();
-		currentConfig.windows.username = username.trim();
-		currentConfig.windows.identityFile = identityFile.trim();
+		currentConfig.source.host = host.trim();
+		currentConfig.source.username = username.trim();
+		currentConfig.source.identityFile = identityFile.trim();
+		currentConfig.source.pathStyle = pathStyle as "auto" | "windows" | "posix";
 		await saveConfig(currentConfig);
 		manager?.setConfig(currentConfig);
 		notify(ctx, "Attachment config saved");
 		return;
 	}
-	if (!value || !["host", "username", "identityFile", "knownHostsFile", "hostKeyAlias", "port"].includes(key)) {
-		notify(ctx, "Usage: /attachments config <host|username|port|identityFile|knownHostsFile|hostKeyAlias> <value>", "warning");
+	if (!value || !["host", "username", "identityFile", "knownHostsFile", "hostKeyAlias", "pathStyle", "port"].includes(key)) {
+		notify(ctx, "Usage: /attachments config <host|username|port|identityFile|knownHostsFile|hostKeyAlias|pathStyle> <value>", "warning");
 		return;
 	}
 	if (key === "port") {
@@ -152,9 +131,15 @@ async function configure(args: string, ctx: ExtensionContext): Promise<void> {
 			notify(ctx, "Invalid SSH port", "warning");
 			return;
 		}
-		currentConfig.windows.port = port;
+		currentConfig.source.port = port;
+	} else if (key === "pathStyle") {
+		if (!(["auto", "windows", "posix"] as const).includes(value as "auto" | "windows" | "posix")) {
+			notify(ctx, "Invalid path style", "warning");
+			return;
+		}
+		currentConfig.source.pathStyle = value as "auto" | "windows" | "posix";
 	} else {
-		currentConfig.windows[key as "host" | "username" | "identityFile" | "knownHostsFile" | "hostKeyAlias"] = value;
+		currentConfig.source[key as "host" | "username" | "identityFile" | "knownHostsFile" | "hostKeyAlias"] = value;
 	}
 	await saveConfig(currentConfig);
 	manager?.setConfig(currentConfig);
@@ -187,8 +172,11 @@ async function handleCommand(args: string, ctx: ExtensionContext): Promise<void>
 	}
 	if (action === "status") {
 		let remote = "unresolved";
+		let pathStyle = currentConfig?.source.pathStyle || "auto";
 		try {
-			const resolved = resolveWindowsRemote(currentConfig!);
+			const source = resolveSourceConfig(currentConfig!);
+			pathStyle = source.pathStyle || "auto";
+			const resolved = resolveSourceRemote(currentConfig!);
 			remote = resolved.username + "@" + resolved.host + ":" + resolved.port;
 		} catch (error) {
 			remote = (error as Error).message;
@@ -196,7 +184,8 @@ async function handleCommand(args: string, ctx: ExtensionContext): Promise<void>
 		const attachments = manager.list();
 		notify(
 			ctx,
-			"Windows host: " + remote +
+			"Source host: " + remote +
+			"\nPath style: " + pathStyle +
 			"\nSFTP: OpenSSH on demand" +
 			"\nAttachments: " + attachments.filter((attachment) => attachment.status === "ready").length + " ready",
 		);
@@ -226,7 +215,7 @@ async function handleCommand(args: string, ctx: ExtensionContext): Promise<void>
 
 export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("attachments", {
-		description: "Manage Windows-to-Ubuntu file attachments",
+		description: "Manage SSH source file attachments",
 		handler: handleCommand,
 	});
 	pi.registerCommand("attach", {
@@ -258,7 +247,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		if (manager) await manager.shutdown();
 		currentContext = ctx;
-		currentConfig = { windows: {} };
+		currentConfig = { source: {} };
 		try {
 			currentConfig = await loadConfig();
 		} catch (error) {
@@ -284,7 +273,7 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 		ctx.ui.setEditorComponent((tui, theme, keybindings) =>
-			new AttachmentEditor(tui, theme, keybindings, (text) => activeManager.replacePastedText(text)),
+			new AttachmentEditor(tui, theme, keybindings, (text, options) => activeManager.replacePastedText(text, options)),
 		);
 	});
 
